@@ -1,1 +1,2 @@
 *.pyc
+gym_maas.egg-info/*
