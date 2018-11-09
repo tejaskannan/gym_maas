@@ -4,19 +4,193 @@ from gym.utils import seeding
 import math
 import numpy as np
 
+# We assume only the rideshare operator is the actor and users' only preference is price
 class MaasSimpleEnv(gym.Env):
+    """
+    Description: Simple mobility as a service environment in which users choice options based on price and
+                 only the rideshare operator has influence over the system. User demand is fixed per timestep.
 
-    # metadata = {'render.modes': ['human']}
+    Observation:
+        Type: Box(|V|), where V is number of vertices
+        Observation             Min    Max
+        Number of vehicles       0      n
 
-    # def __init__(self):
-    #     raise NotImplementedError
+        Here, n is the total number of vehicles. This specification holds for every vertex
 
-    # def step(self, action):
-    #     raise NotImplementedError
+    Action:
+        Type: Dict Space of Tuples, each tuple entry represents an edge
+        price:  (..., Box(1){Min: 0, Max: np.inf} ,...)
+        rebalance: (..., Discrete(n_{ij}), ...)
 
-    # def reset(self):
-    #     raise NotImplementedError
+        The price actions represent setting the price multiplier
+        The relabalcing actions represent the number of cars to send along each edge without carrying a customer
+        The numbers here represent the valid number of cars to send
+    """
 
-    # def render(self, mode='human', close=False):
-    #     raise NotImplementedError
+    metadata = {'render.modes': ['human']}
 
+    def __init__(self):
+
+        self.num_vertices = 4
+        self.total_cars = 20
+        self.num_edges = 8
+
+        # For now, we create a hard-coded transportation graph of 4 nodes
+        self.transportation_graph = {
+            0: [TransportEdge(1, 2, 6, 4, 10), TransportEdge(1, 3, 2, 1.5, 12)],
+            1: [TransportEdge(2, 1, 0, 0.1, 0), TransportEdge(2, 4, 0, 1, 0)],
+            2: [TransportEdge(3, 1, 0, 1, 0), TransportEdge(3, 4, 0, 0.1, 0)],
+            3: [TransportEdge(4, 2, 2, 1.5, 12), TransportEdge(4, 3, 6, 4, 10)]
+        }
+
+        # Define the observation space
+        observation_min = np.zeros(self.num_vertices)
+        observation_max = np.full(self.num_vertices, self.total_cars)
+        self.observation_space = spaces.Box(observation_min, observation_max, dtype=np.int32)
+
+        # Initialize price action space
+        price_multipliers = dict()
+        for i in range(0, self.num_vertices):
+            price_tuples = tuple([spaces.Box(0, np.inf, shape=(1,), dtype=np.float32) for _ in range(len(self.transportation_graph[i]))])
+            price_multipliers[i] = spaces.Tuple(price_tuples)
+        self.price_actions = spaces.Dict(price_multipliers)
+
+        self.seed()
+
+        # The state is a list of the number of available cars at each node
+        self.state = None
+
+    def seed(self, seed=None):
+        self.np_random, seed = seeding.np_random(seed)
+        return [seed]
+
+
+    def step(self, action):
+        action_space = self.get_action_space()
+        assert action_space.contains(action), "%r (%s) invalid"%(action, type(action))
+
+        # We simulate the action on this particular state. The transition depends on the randomness
+        # introduced by consumer actions
+        state = self.state
+        rideshare_profits = 0
+
+        # Initialize New State
+        new_state = np.zeros(len(state))
+
+        for source in range(0, self.num_vertices):
+            out_edges = self.transportation_graph[source]
+            rideshare_counts = []
+            profits = []
+            for edge in edges:
+
+                # Get the price multiplier specified by this action
+                price_multiplier = action["price_mult"][edge.source][edge.dest] # check how to get out scalar
+                
+                # Keep track of the price of a ride on this edge for tiebreaking
+                profits.append(edge.rideshare_cost * (price_multiplier - 1))
+
+                prob_of_rideshare = self.get_rideshare_probability(edge.rideshare_cost * price_multiplier, edge.transit_cost)
+                num_rideshare = self._simulate_rideshare(edge.demand, prob_of_rideshare)
+                rideshare_counts.append((num_rideshare, edge.dest))
+
+            # The number of people who want to take rideshare may be greater than the number of available
+            # cars. The default policy for rideshare operators is to use cars on the links which give maximum
+            # profit.
+            sorted_price_indices = np.argsort(profits)
+            num_cars = state[source]
+            for i in sorted_price_indices:
+                if num_cars <= 0:
+                    break
+
+                # Determine the number of cars to send
+                count, dest = rideshare_counts[i]
+                cars_to_send = min(count, num_cars)
+
+                # Decrement number of cars available at this node
+                num_cars -= cars_to_send
+
+                # Add the profit of these trips
+                rideshare_profits += cars_to_send * profits[i]
+
+                # Update Car Counts
+                new_state[dest] += cars_to_send
+
+            # After rides have been decided, rebalancing is factored in. By default, if more rebalancing than
+            # available cars is asked, then the links with lowest cost are chosen
+            rebalance_counts = [(action["rebalance"][edge.source][edge.dest], edge.dest) for edge in edges]
+            rebalance_costs = [edge.rideshare_cost for edge in edges]
+            rebalance_indices = np.flip(np.argsort(rebalance_costs))
+            for i in rebalance_indices:
+                if num_cars <= 0:
+                    break
+                count, dest = rebalance_counts[i]
+                cars_to_send = min(count, num_cars)
+
+                num_cars -= cars_to_send
+
+                rideshare_profits -= cars_to_send * rebalance_costs[i]
+
+                new_state[dest] += cars_to_send
+            
+            # The remaining cars stay put
+            new_state[source] += num_cars 
+
+        # The simulation is never done, this is an infinite horizon MDP and there is no 'failure' case
+        return np.array(new_state), rideshare_profits, False, {}
+
+    def reset(self):
+        # Generate an initial distribution of cars
+        self.state = self.np_random.rand(self.num_vertices)
+
+        # We need to ensure the sum is equal to the total number of cars
+        # This method may not generate a uniform distribution, but suffices for our purposes
+        self.state = self.state / np.sum(self.state)
+        self.state = self.state * self.total_cars
+        self.state = self.state.astype(int)
+        diff = self.total_cars - np.sum(self.state)
+        self.state[0] += diff # We add the remaining cars to the first vertex
+        
+        return np.array(self.state)
+
+    def render(self, mode='human', close=False):
+        return None
+
+    # The actions are dependent on the states because rebalancing depends on availability of cars
+    def get_action_space(self):
+        rebalancing = dict()
+        for i in range(0, self.num_vertices):
+            num_cars = self.state[i]
+            rebalancing_tuples = tuple([spaces.Box(0, num_cars, shape=(1,), dtype=np.int32) for _ in range(len(self.transportation_graph[i]))])
+            rebalancing[i] = spaces.Tuple(rebalancing_tuples)
+
+        return spaces.Dict({"price_mult": self.price_actions, "rebalance": spaces.Dict(rebalancing)})
+
+
+    # This represents the probability of a user choosing rideshare over public transit
+    # using the given prices. Operates under a Gumbel choice model.
+    def get_rideshare_probability(self, rideshare_cost, transit_cost):
+        exp = np.exp(self._choice_cost_function(rideshare_cost, transit_cost))
+        return float(exp) / float(1 + exp)
+
+    # This cost function has been arbitrarily created
+    def _choice_cost_function(self, rideshare_cost, transit_cost):
+        return 100 - rideshare_cost + transit_cost
+
+    # Returns the number of users who want to take rideshare. The remaining take public transit.
+    def _simulate_rideshare(self, demand, rideshare_prob):
+        consumer_decisions = self.np_random.rand(demand)
+        return len(consumer_decisions.where(x < rideshare_prob))
+
+class TransportEdge:
+
+    def __init__(self, source, dest, transit_cost, rideshare_cost, demand):
+        self.source = source
+        self.dest = dest
+        self.transit_cost = transit_cost
+        self.rideshare_cost = rideshare_cost
+        self.demand = demand
+
+class TransportVertex:
+
+    def __init__(self, label):
+        self.label = label
