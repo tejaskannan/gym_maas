@@ -3,6 +3,38 @@ from gym import error, spaces, logger, utils
 from gym.utils import seeding
 import math
 import numpy as np
+import os
+import json
+
+SOURCE = "source"
+DEST = "dest"
+TRANSIT_COST = "transit_cost"
+RIDESHARE_COST = "rideshare_cost"
+DEMAND = "demand"
+
+
+def parse_edge(vertex, edge_json_obj):
+    return TransportEdge(source=vertex, dest=edge_json_obj[DEST], transit_cost=edge_json_obj[TRANSIT_COST],
+                         rideshare_cost=edge_json_obj[RIDESHARE_COST], demand=edge_json_obj[DEMAND])
+
+def import_transportation_graph(file_name):
+    json_string = None
+    with open(file_name, 'r') as config_file:
+        json_string = config_file.read()
+
+    assert json_string, "JSON configuration could not be parsed. Given: {}".format(json_string)
+
+    json_config = json.loads(json_string)
+
+    graph = {}
+    vertex_list = []
+    for vertex in json_config.keys():
+        graph[vertex] = [parse_edge(vertex, edge_obj) for edge_obj in json_config[vertex]]
+        vertex_list.append(vertex)
+
+    return graph, vertex_list
+        
+
 
 # We assume only the rideshare operator is the actor and users' only preference is price
 class MaasSimpleEnv(gym.Env):
@@ -53,20 +85,27 @@ class MaasSimpleEnv(gym.Env):
 
         # For now, we create a hard-coded transportation graph of 4 nodes. This is represented
         # as a dictionary to easily enable re-naming vertices. 
-        self.transportation_graph = {
-            0: [TransportEdge(0, 1, 6, 4, 10), TransportEdge(0, 2, 2, 1.5, 12)],
-            1: [TransportEdge(1, 0, 0, 0.1, 0), TransportEdge(1, 3, 0, 1, 0)],
-            2: [TransportEdge(2, 0, 0, 1, 0), TransportEdge(2, 3, 0, 0.1, 0)],
-            3: [TransportEdge(3, 1, 2, 1.5, 12), TransportEdge(3, 2, 6, 4, 10)]
-        }
+        # self.transportation_graph = {
+        #     0: [TransportEdge(0, 1, 6, 4, 10), TransportEdge(0, 2, 2, 1.5, 12)],
+        #     1: [TransportEdge(1, 0, 0, 0.1, 0), TransportEdge(1, 3, 0, 1, 0)],
+        #     2: [TransportEdge(2, 0, 0, 1, 0), TransportEdge(2, 3, 0, 0.1, 0)],
+        #     3: [TransportEdge(3, 1, 2, 1.5, 12), TransportEdge(3, 2, 6, 4, 10)]
+        # }
+        self.transportation_graph, self.vertex_list = import_transportation_graph('transportation_graph.json')
 
         # Compute the number of vertices based on the graph
         self.num_vertices = len(self.transportation_graph.keys())
+
+        print(self.transportation_graph)
 
         # Compute the number of edges based on the graph
         self.num_edges = 0
         for value in self.transportation_graph.values():
             self.num_edges += len(value)
+
+        print(self.num_vertices)
+        print(self.num_edges)
+
 
         # Define the observation space
         observation_min = np.zeros(self.num_vertices)
@@ -75,7 +114,7 @@ class MaasSimpleEnv(gym.Env):
 
         # We make our action space a VxV matrix for simplicity. This can be translated
         # to an adjacency list style model later on for space conservation.
-        self.price_actions = self._form_matrix_action_space(max_value = self.MAX_MULTIPLIER)
+        self.price_actions = self._form_price_action_space(max_value = self.MAX_MULTIPLIER)
 
         # Initialize price action space in an adjacendy list manner
         # price_multipliers = dict()
@@ -107,7 +146,8 @@ class MaasSimpleEnv(gym.Env):
         # Initialize New State
         new_state = np.zeros(len(state))
 
-        for source in range(0, self.num_vertices):
+        for source_index in range(0, self.num_vertices):
+            source = self.vertex_list[source_index]
             out_edges = self.transportation_graph[source]
             rideshare_counts = []
             profits = []
@@ -211,7 +251,8 @@ class MaasSimpleEnv(gym.Env):
         min_rebalance = np.zeros(shape=(self.num_vertices, self.num_vertices))
         max_rebalance = np.zeros(shape=(self.num_vertices, self.num_vertices))
         for i in range(0, self.num_vertices):
-            edges = self.transportation_graph[i]
+            vertex = self.vertex_list[i]
+            edges = self.transportation_graph[vertex]
             for j in range(0, self.num_vertices):
                 edge = self._get_edge(i, j)
                 if edge:
@@ -263,14 +304,15 @@ class MaasSimpleEnv(gym.Env):
                 return edge
         return False
 
-    def _form_matrix_action_space(self, max_value, data_type='float32'):
+    def _form_price_action_space(self, max_value, data_type='float32'):
         min_values = np.zeros(shape=(self.num_vertices, self.num_vertices))
         max_values = np.zeros(shape=(self.num_vertices, self.num_vertices))
         for i in range(0, self.num_vertices):
-            edges = self.transportation_graph[i]
+            vertex = self.vertex_list[i]
+            edges = self.transportation_graph[vertex]
             for j in range(0, self.num_vertices):
                 edge = self._get_edge(i, j)
-                if edge:
+                if edge and edge.demand > 0:
                     max_values[i, j] = max_value
         return spaces.Box(min_values, max_values, dtype=data_type)
 
@@ -283,3 +325,5 @@ class TransportEdge:
         self.transit_cost = transit_cost
         self.rideshare_cost = rideshare_cost
         self.demand = demand
+
+
