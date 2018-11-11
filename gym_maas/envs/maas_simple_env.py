@@ -30,6 +30,9 @@ class MaasSimpleEnv(gym.Env):
     metadata = {'render.modes': ['human']}
 
     MAX_MULTIPLIER = 5
+    PRICE_MULT = 'price-mult'
+    REBALANCE = 'rebalance'
+    COST_FACTOR = 1
 
     def __init__(self):
 
@@ -89,13 +92,14 @@ class MaasSimpleEnv(gym.Env):
             out_edges = self.transportation_graph[source]
             rideshare_counts = []
             profits = []
-            for edge in edges:
+            for edge in out_edges:
 
                 # Get the price multiplier specified by this action
-                price_multiplier = action["price_mult"][edge.source][edge.dest] # check how to get out scalar
+                price_multiplier = self._get_action_value(action, self.PRICE_MULT, edge)
                 
-                # Keep track of the price of a ride on this edge for tiebreaking
-                profits.append(edge.rideshare_cost * (price_multiplier - 1))
+                # Keep track of the price of a ride on this edge for tiebreaking, we subtract 1 because
+                # profits are determined by the multiplier price above the cost of transportation
+                profits.append(edge.rideshare_cost * (price_multiplier - self.COST_FACTOR))
 
                 prob_of_rideshare = self.get_rideshare_probability(edge.rideshare_cost * price_multiplier, edge.transit_cost)
                 num_rideshare = self._simulate_rideshare(edge.demand, prob_of_rideshare)
@@ -125,8 +129,8 @@ class MaasSimpleEnv(gym.Env):
 
             # After rides have been decided, rebalancing is factored in. By default, if more rebalancing than
             # available cars is asked, then the links with lowest cost are chosen
-            rebalance_counts = [(action["rebalance"][edge.source][edge.dest], edge.dest) for edge in edges]
-            rebalance_costs = [edge.rideshare_cost for edge in edges]
+            rebalance_counts = [(self._get_action_value(action, self.REBALANCE, edge), edge.dest) for edge in out_edges]
+            rebalance_costs = [edge.rideshare_cost for edge in out_edges]
             rebalance_indices = np.flip(np.argsort(rebalance_costs))
             for i in rebalance_indices:
                 if num_cars <= 0:
@@ -184,7 +188,7 @@ class MaasSimpleEnv(gym.Env):
         #     rebalancing_tuples = tuple([spaces.Box(0, num_cars, shape=(1,), dtype=np.int32) for _ in range(len(self.transportation_graph[i]))])
         #     rebalancing[str(i)] = spaces.Tuple(rebalancing_tuples)
 
-        return spaces.Dict({"price_mult": self.price_actions, "rebalance": rebalance_action_space})
+        return spaces.Dict({self.PRICE_MULT: self.price_actions, self.REBALANCE: rebalance_action_space})
 
 
     # This represents the probability of a user choosing rideshare over public transit
@@ -193,14 +197,23 @@ class MaasSimpleEnv(gym.Env):
         exp = np.exp(self._choice_cost_function(rideshare_cost, transit_cost))
         return float(exp) / float(1 + exp)
 
-    # This cost function has been arbitrarily created
+    # This cost function has been arbitrarily created for experimentation
     def _choice_cost_function(self, rideshare_cost, transit_cost):
-        return 10 - rideshare_cost + transit_cost
+        return 1 - rideshare_cost + transit_cost
 
     # Returns the number of users who want to take rideshare. The remaining take public transit.
+    # This function generates a sample from the consumer discrete choice model.
     def _simulate_rideshare(self, demand, rideshare_prob):
         consumer_decisions = self.np_random.rand(demand)
-        return len(consumer_decisions.where(x < rideshare_prob))
+        rideshare_count = 0
+        for decision in consumer_decisions:
+            if decision < rideshare_prob:
+                rideshare_count += 1
+        return rideshare_count
+
+    def _get_action_value(self, action, action_type, edge):
+        action_matrix = action[action_type]
+        return action_matrix[edge.source, edge.dest]
 
     def _get_edge(self, source, dest):
         if not source in self.transportation_graph:
@@ -221,6 +234,7 @@ class MaasSimpleEnv(gym.Env):
                 if edge:
                     max_values[i, j] = max_value
         return spaces.Box(min_values, max_values, dtype=data_type)
+
 
 class TransportEdge:
 
