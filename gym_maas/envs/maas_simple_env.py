@@ -18,9 +18,11 @@ class MaasSimpleEnv(gym.Env):
         Here, n is the total number of vehicles. This specification holds for every vertex
 
     Action:
-        Type: Dict Space of Tuples, each tuple entry represents an edge
-        price:  (..., Box(1){Min: 0, Max: np.inf} ,...)
-        rebalance: (..., Discrete(n_{ij}), ...)
+        Type: Dict Space of Box Matrices. Element (i,j) of the box represents the price or rebalance
+              factor on the edge from i to j. If no such edge exists, the bounds for this element will be
+              min 0, max 0.
+        price-mult:  Box of price multipliers
+        rebalance: Box of rebalancing quantities 
 
         The price actions represent setting the price multiplier
         The relabalcing actions represent the number of cars to send along each edge without carrying a customer
@@ -29,19 +31,28 @@ class MaasSimpleEnv(gym.Env):
 
     metadata = {'render.modes': ['human']}
 
+    # Maximum price multiplier. Making this value small decreases action space.
     MAX_MULTIPLIER = 5
+
+    # Proportion of a rideshare ride which is seen as cost. A value of 1 means all rideshare profits
+    # come from multipliers (i.e. the baseline price is equal to the cost).
+    COST_FACTOR = 1
+
+    # Total number of available rideshare cars
+    TOTAL_CARS = 20
+
+    # Constant in the logistic discrete choice probability. Ideally, this constant should be fit
+    # from data. For now, we hard-code its value.
+    PROBABILITY_CONSTANT = 1
+
+    # Action space dictionary keys
     PRICE_MULT = 'price-mult'
     REBALANCE = 'rebalance'
-    COST_FACTOR = 1
 
     def __init__(self):
 
-
-        self.num_vertices = 4
-        self.total_cars = 20
-        self.num_edges = 8
-
-        # For now, we create a hard-coded transportation graph of 4 nodes
+        # For now, we create a hard-coded transportation graph of 4 nodes. This is represented
+        # as a dictionary to easily enable re-naming vertices. 
         self.transportation_graph = {
             0: [TransportEdge(0, 1, 6, 4, 10), TransportEdge(0, 2, 2, 1.5, 12)],
             1: [TransportEdge(1, 0, 0, 0.1, 0), TransportEdge(1, 3, 0, 1, 0)],
@@ -49,16 +60,24 @@ class MaasSimpleEnv(gym.Env):
             3: [TransportEdge(3, 1, 2, 1.5, 12), TransportEdge(3, 2, 6, 4, 10)]
         }
 
+        # Compute the number of vertices based on the graph
+        self.num_vertices = len(self.transportation_graph.keys())
+
+        # Compute the number of edges based on the graph
+        self.num_edges = 0
+        for value in self.transportation_graph.values():
+            self.num_edges += len(value)
+
         # Define the observation space
         observation_min = np.zeros(self.num_vertices)
-        observation_max = np.full(shape=self.num_vertices, fill_value=self.total_cars)
+        observation_max = np.full(shape=self.num_vertices, fill_value=self.TOTAL_CARS)
         self.observation_space = spaces.Box(observation_min, observation_max, dtype=np.int32)
 
         # We make our action space a VxV matrix for simplicity. This can be translated
         # to an adjacency list style model later on for space conservation.
         self.price_actions = self._form_matrix_action_space(max_value = self.MAX_MULTIPLIER)
 
-        # Initialize price action space
+        # Initialize price action space in an adjacendy list manner
         # price_multipliers = dict()
         # for i in range(0, self.num_vertices):
         #     price_tuples = tuple([spaces.Box(0, np.inf, shape=(1,), dtype='float32') for _ in range(len(self.transportation_graph[i]))])
@@ -68,7 +87,7 @@ class MaasSimpleEnv(gym.Env):
         # Initialize Seed
         self.seed()
 
-        # The state is a list of the number of available cars at each node
+        # The state is a list of the number of available cars at each node. Initialized in reset() function.
         self.state = None
 
     def seed(self, seed=None):
@@ -121,33 +140,50 @@ class MaasSimpleEnv(gym.Env):
                 # Decrement number of cars available at this node
                 num_cars -= cars_to_send
 
+                # Update the number of cars at the destination
+                new_state[dest] += cars_to_send
+
                 # Add the profit of these trips
                 rideshare_profits += cars_to_send * profits[i]
-
-                # Update Car Counts
-                new_state[dest] += cars_to_send
 
             # After rides have been decided, rebalancing is factored in. By default, if more rebalancing than
             # available cars is asked, then the links with lowest cost are chosen
             rebalance_counts = [(self._get_action_value(action, self.REBALANCE, edge), edge.dest) for edge in out_edges]
-            rebalance_costs = [edge.rideshare_cost for edge in out_edges]
+            rebalance_costs = [edge.rideshare_cost * self.COST_FACTOR for edge in out_edges]
             rebalance_indices = np.flip(np.argsort(rebalance_costs))
             for i in rebalance_indices:
                 if num_cars <= 0:
                     break
+
+                # Find the rebalancing counts and destinations determined by this action
                 count, dest = rebalance_counts[i]
+
+                # Determine the maximum number of cars we can send
                 cars_to_send = min(count, num_cars)
 
+                # Reduce the number of cars at this vertex
                 num_cars -= cars_to_send
 
+                # Increase the number of cars at the destination
+                new_state[dest] += cars_to_send
+
+                # Reduce the profits by the cost it takes to send this car without a customer
                 rideshare_profits -= cars_to_send * rebalance_costs[i]
 
-                new_state[dest] += cars_to_send
-            
-            # The remaining cars stay put
-            new_state[source] += num_cars 
+            # The remaining cars stay put at this vertex
+            new_state[source] += num_cars
 
-        # The simulation is never done, this is an infinite horizon MDP and there is no 'failure' case
+
+        # Validate the new state. We leave this in for now for testing purposes. This part should
+        # be removed later on.
+        car_count = 0
+        for count in new_state:
+            assert count >= 0, "Number of cars should not be negative."
+            car_count += count
+        assert car_count == self.TOTAL_CARS, "Number of cars should never decrease."
+
+        # The simulation is never done. This is an infinite horizon MDP and there is no 'failure' case.
+        # Trianing algorithm should instead determine a stopping threshold.
         return np.array(new_state), rideshare_profits, False, {}
 
     def reset(self):
@@ -157,10 +193,13 @@ class MaasSimpleEnv(gym.Env):
         # We need to ensure the sum is equal to the total number of cars
         # This method may not generate a uniform distribution, but suffices for our purposes
         self.state = self.state / np.sum(self.state)
-        self.state = self.state * self.total_cars
+        self.state = self.state * self.TOTAL_CARS
         self.state = self.state.astype(int)
-        diff = self.total_cars - np.sum(self.state)
-        self.state[0] += diff # We add the remaining cars to the first vertex
+
+        # We add the remaining cars to a random vertex
+        rand_index = self.np_random.randint(low=0, high=self.num_vertices)
+        diff = self.TOTAL_CARS - np.sum(self.state)
+        self.state[rand_index] += diff
         
         return np.array(self.state)
 
@@ -199,7 +238,7 @@ class MaasSimpleEnv(gym.Env):
 
     # This cost function has been arbitrarily created for experimentation
     def _choice_cost_function(self, rideshare_cost, transit_cost):
-        return 1 - rideshare_cost + transit_cost
+        return self.PROBABILITY_CONSTANT - rideshare_cost + transit_cost
 
     # Returns the number of users who want to take rideshare. The remaining take public transit.
     # This function generates a sample from the consumer discrete choice model.
@@ -244,8 +283,3 @@ class TransportEdge:
         self.transit_cost = transit_cost
         self.rideshare_cost = rideshare_cost
         self.demand = demand
-
-class TransportVertex:
-
-    def __init__(self, label):
-        self.label = label
