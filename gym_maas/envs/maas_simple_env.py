@@ -29,7 +29,10 @@ class MaasSimpleEnv(gym.Env):
 
     metadata = {'render.modes': ['human']}
 
+    MAX_MULTIPLIER = 5
+
     def __init__(self):
+
 
         self.num_vertices = 4
         self.total_cars = 20
@@ -37,24 +40,29 @@ class MaasSimpleEnv(gym.Env):
 
         # For now, we create a hard-coded transportation graph of 4 nodes
         self.transportation_graph = {
-            0: [TransportEdge(1, 2, 6, 4, 10), TransportEdge(1, 3, 2, 1.5, 12)],
-            1: [TransportEdge(2, 1, 0, 0.1, 0), TransportEdge(2, 4, 0, 1, 0)],
-            2: [TransportEdge(3, 1, 0, 1, 0), TransportEdge(3, 4, 0, 0.1, 0)],
-            3: [TransportEdge(4, 2, 2, 1.5, 12), TransportEdge(4, 3, 6, 4, 10)]
+            0: [TransportEdge(0, 1, 6, 4, 10), TransportEdge(0, 2, 2, 1.5, 12)],
+            1: [TransportEdge(1, 0, 0, 0.1, 0), TransportEdge(1, 3, 0, 1, 0)],
+            2: [TransportEdge(2, 0, 0, 1, 0), TransportEdge(2, 3, 0, 0.1, 0)],
+            3: [TransportEdge(3, 1, 2, 1.5, 12), TransportEdge(3, 2, 6, 4, 10)]
         }
 
         # Define the observation space
         observation_min = np.zeros(self.num_vertices)
-        observation_max = np.full(self.num_vertices, self.total_cars)
+        observation_max = np.full(shape=self.num_vertices, fill_value=self.total_cars)
         self.observation_space = spaces.Box(observation_min, observation_max, dtype=np.int32)
 
-        # Initialize price action space
-        price_multipliers = dict()
-        for i in range(0, self.num_vertices):
-            price_tuples = tuple([spaces.Box(0, np.inf, shape=(1,), dtype=np.float32) for _ in range(len(self.transportation_graph[i]))])
-            price_multipliers[i] = spaces.Tuple(price_tuples)
-        self.price_actions = spaces.Dict(price_multipliers)
+        # We make our action space a VxV matrix for simplicity. This can be translated
+        # to an adjacency list style model later on for space conservation.
+        self.price_actions = self._form_matrix_action_space(max_value = self.MAX_MULTIPLIER)
 
+        # Initialize price action space
+        # price_multipliers = dict()
+        # for i in range(0, self.num_vertices):
+        #     price_tuples = tuple([spaces.Box(0, np.inf, shape=(1,), dtype='float32') for _ in range(len(self.transportation_graph[i]))])
+        #     price_multipliers[str(i)] = spaces.Tuple(price_tuples)
+        # self.price_actions = spaces.Dict(price_multipliers)
+
+        # Initialize Seed
         self.seed()
 
         # The state is a list of the number of available cars at each node
@@ -157,13 +165,26 @@ class MaasSimpleEnv(gym.Env):
 
     # The actions are dependent on the states because rebalancing depends on availability of cars
     def get_action_space(self):
-        rebalancing = dict()
+        min_rebalance = np.zeros(shape=(self.num_vertices, self.num_vertices))
+        max_rebalance = np.zeros(shape=(self.num_vertices, self.num_vertices))
         for i in range(0, self.num_vertices):
-            num_cars = self.state[i]
-            rebalancing_tuples = tuple([spaces.Box(0, num_cars, shape=(1,), dtype=np.int32) for _ in range(len(self.transportation_graph[i]))])
-            rebalancing[i] = spaces.Tuple(rebalancing_tuples)
+            edges = self.transportation_graph[i]
+            for j in range(0, self.num_vertices):
+                edge = self._get_edge(i, j)
+                if edge:
+                    # Our rebalancing action is dependent on the number of cars at this vertex
+                    num_cars = self.state[i]
+                    max_rebalance[i, j] = num_cars
+        rebalance_action_space = spaces.Box(min_rebalance, max_rebalance, dtype='int32')
 
-        return spaces.Dict({"price_mult": self.price_actions, "rebalance": spaces.Dict(rebalancing)})
+        # Adjacency list style of action space
+        # rebalancing = dict()
+        # for i in range(0, self.num_vertices):
+        #     num_cars = self.state[i]
+        #     rebalancing_tuples = tuple([spaces.Box(0, num_cars, shape=(1,), dtype=np.int32) for _ in range(len(self.transportation_graph[i]))])
+        #     rebalancing[str(i)] = spaces.Tuple(rebalancing_tuples)
+
+        return spaces.Dict({"price_mult": self.price_actions, "rebalance": rebalance_action_space})
 
 
     # This represents the probability of a user choosing rideshare over public transit
@@ -174,12 +195,32 @@ class MaasSimpleEnv(gym.Env):
 
     # This cost function has been arbitrarily created
     def _choice_cost_function(self, rideshare_cost, transit_cost):
-        return 100 - rideshare_cost + transit_cost
+        return 10 - rideshare_cost + transit_cost
 
     # Returns the number of users who want to take rideshare. The remaining take public transit.
     def _simulate_rideshare(self, demand, rideshare_prob):
         consumer_decisions = self.np_random.rand(demand)
         return len(consumer_decisions.where(x < rideshare_prob))
+
+    def _get_edge(self, source, dest):
+        if not source in self.transportation_graph:
+            return None
+        edges = self.transportation_graph[source]
+        for edge in edges:
+            if edge.dest == dest:
+                return edge
+        return False
+
+    def _form_matrix_action_space(self, max_value, data_type='float32'):
+        min_values = np.zeros(shape=(self.num_vertices, self.num_vertices))
+        max_values = np.zeros(shape=(self.num_vertices, self.num_vertices))
+        for i in range(0, self.num_vertices):
+            edges = self.transportation_graph[i]
+            for j in range(0, self.num_vertices):
+                edge = self._get_edge(i, j)
+                if edge:
+                    max_values[i, j] = max_value
+        return spaces.Box(min_values, max_values, dtype=data_type)
 
 class TransportEdge:
 
