@@ -3,7 +3,7 @@ from gym import error, spaces, logger, utils
 from gym.utils import seeding
 import math
 import numpy as np
-from gym_maas.envs.utils import import_transportation_graph        
+from gym_maas.envs.utils import import_parameters        
 
 
 # We assume only the rideshare operator is the actor and users' only preference is price
@@ -23,7 +23,7 @@ class MaasSimpleEnv(gym.Env):
         Type: Dict Space of Box Matrices. Element (i,j) of the box represents the price or rebalance
               factor on the edge from i to j. If no such edge exists, the bounds for this element will be
               min 0, max 0.
-        price-mult:  Box of price multipliers
+        price-mult:  Box of price multipliers. The multiplier on a 0-demand edge is set to 0.
         rebalance: Box of rebalancing quantities 
 
         The price actions represent setting the price multiplier
@@ -32,18 +32,7 @@ class MaasSimpleEnv(gym.Env):
     """
 
     metadata = {'render.modes': ['human']}
-
-    # Maximum price multiplier. Making this value small decreases action space. For now, 5 seems like
-    # a realistic upper bound on the multiplier.
-    MAX_MULTIPLIER = 5
-
-    # Proportion of a rideshare ride which is seen as cost. A value of 1 means all rideshare profits
-    # come from multipliers (i.e. the baseline price is equal to the cost).
-    COST_FACTOR = 1
-
-    # Total number of available rideshare cars
-    TOTAL_CARS = 20
-
+    
     # Constant in the logistic discrete choice probability. Ideally, this constant should be fit
     # from data. For now, we hard-code its value.
     PROBABILITY_CONSTANT = 1
@@ -53,12 +42,22 @@ class MaasSimpleEnv(gym.Env):
     REBALANCE = 'rebalance'
 
     # Configuration File Name
-    CONFIG_FILE_NAME = 'transportation_graph.json'
+    CONFIG_FILE_NAME = 'maas_config.json'
 
     def __init__(self):
 
         # Import transportation graph from configuration file
-        self.transportation_graph, self.vertex_map = import_transportation_graph(self.CONFIG_FILE_NAME)
+        self.transportation_graph, self.vertex_map, config = import_parameters(self.CONFIG_FILE_NAME)
+
+        # Total number of available rideshare cars
+        self.total_cars = config['total_rideshare_cars']
+
+        # Maximum price multiplier. Making this value small decreases action space.
+        self.max_multiplier = config['max_multiplier']
+
+        # Proportion of a rideshare ride which is seen as cost. A value of 1 means all rideshare profits
+        # come from multipliers (i.e. the baseline price is equal to the cost).
+        self.cost_proportion = config['rideshare_cost_proportion']
 
         # Compute the number of vertices based on the graph
         self.num_vertices = len(self.vertex_map.keys())
@@ -70,12 +69,12 @@ class MaasSimpleEnv(gym.Env):
 
         # Define the observation space
         observation_min = np.zeros(self.num_vertices)
-        observation_max = np.full(shape=self.num_vertices, fill_value=self.TOTAL_CARS)
+        observation_max = np.full(shape=self.num_vertices, fill_value=self.total_cars)
         self.observation_space = spaces.Box(observation_min, observation_max, dtype=np.int32)
 
         # We make our action space a VxV matrix for simplicity. This can be translated
         # to an adjacency list style model later on for space conservation.
-        self.price_actions = self._form_price_action_space(max_value = self.MAX_MULTIPLIER)
+        self.price_actions = self._form_price_action_space(max_value = self.max_multiplier)
 
         # Initialize Seed
         self.seed()
@@ -111,7 +110,7 @@ class MaasSimpleEnv(gym.Env):
                 
                 # Keep track of the price of a ride on this edge for tiebreaking, we subtract 1 because
                 # profits are determined by the multiplier price above the cost of transportation
-                profits.append(edge.rideshare_cost * (price_multiplier - self.COST_FACTOR))
+                profits.append(edge.rideshare_cost * (price_multiplier - self.cost_proportion))
 
                 prob_of_rideshare = self.get_rideshare_probability(edge.rideshare_cost * price_multiplier, edge.transit_cost)
                 num_rideshare = self._simulate_rideshare(edge.demand, prob_of_rideshare)
@@ -142,7 +141,7 @@ class MaasSimpleEnv(gym.Env):
             # After rides have been decided, rebalancing is factored in. By default, if more rebalancing than
             # available cars is asked, then the links with lowest cost are chosen
             rebalance_counts = [(self._get_action_value(action, self.REBALANCE, edge), edge.dest) for edge in out_edges]
-            rebalance_costs = [edge.rideshare_cost * self.COST_FACTOR for edge in out_edges]
+            rebalance_costs = [edge.rideshare_cost * self.cost_proportion for edge in out_edges]
             rebalance_indices = np.flip(np.argsort(rebalance_costs))
             for i in rebalance_indices:
                 if num_cars <= 0:
@@ -173,7 +172,7 @@ class MaasSimpleEnv(gym.Env):
         for count in new_state:
             assert count >= 0, "Number of cars should not be negative."
             car_count += count
-        assert car_count == self.TOTAL_CARS, "Number of cars should never decrease."
+        assert car_count == self.total_cars, "Number of cars should never decrease."
 
         # The simulation is never done. This is an infinite horizon MDP and there is no 'failure' case.
         # Trianing algorithm should instead determine a stopping threshold.
@@ -186,12 +185,12 @@ class MaasSimpleEnv(gym.Env):
         # We need to ensure the sum is equal to the total number of cars
         # This method may not generate a uniform distribution, but suffices for our purposes
         self.state = self.state / np.sum(self.state)
-        self.state = self.state * self.TOTAL_CARS
+        self.state = self.state * self.total_cars
         self.state = self.state.astype(int)
 
         # We add the remaining cars to a random vertex
         rand_index = self.np_random.randint(low=0, high=self.num_vertices)
-        diff = self.TOTAL_CARS - np.sum(self.state)
+        diff = self.total_cars - np.sum(self.state)
         self.state[rand_index] += diff
         
         return np.array(self.state)
